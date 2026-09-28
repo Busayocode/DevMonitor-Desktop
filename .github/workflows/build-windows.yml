@@ -1,4 +1,3 @@
-
 name: Build DevMonitor Windows Installer
 
 on:
@@ -42,8 +41,19 @@ jobs:
             throw "package.json not found in the extracted source."
           }
           Set-Location $package.DirectoryName
+
+          $packageJson = Get-Content -LiteralPath "package.json" -Raw | ConvertFrom-Json
+          $electronVersion = $packageJson.dependencies.electron
+          if ($electronVersion) {
+            npm pkg set "devDependencies.electron=$electronVersion"
+            if ($LASTEXITCODE -ne 0) { throw "Could not move Electron to devDependencies." }
+            npm pkg delete "dependencies.electron"
+            if ($LASTEXITCODE -ne 0) { throw "Could not remove Electron from dependencies." }
+          }
+
           npm install --no-audit --no-fund
           if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed." }
+
           npm run dist
           if ($LASTEXITCODE -ne 0) { throw "Windows installer build failed." }
 
