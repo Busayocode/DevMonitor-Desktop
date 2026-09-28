@@ -1,1 +1,56 @@
 
+name: Build DevMonitor Windows Installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Extract desktop source
+        shell: pwsh
+        run: |
+          $archives = @(Get-ChildItem -Path . -Filter "*.zip" -File)
+          if ($archives.Count -ne 1) {
+            throw "Expected exactly one source ZIP; found $($archives.Count)."
+          }
+          Expand-Archive -LiteralPath $archives[0].FullName -DestinationPath "$env:GITHUB_WORKSPACE/desktop-source" -Force
+
+      - name: Install dependencies and build
+        shell: pwsh
+        run: |
+          $package = Get-ChildItem -Path "$env:GITHUB_WORKSPACE/desktop-source" -Filter "package.json" -Recurse -File | Select-Object -First 1
+          if (-not $package) {
+            throw "package.json not found in the extracted source."
+          }
+          Set-Location $package.DirectoryName
+          npm install --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed." }
+          npm run dist
+          if ($LASTEXITCODE -ne 0) { throw "Windows installer build failed." }
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: DevMonitor-Windows-Installer
+          path: desktop-source/**/release/*.exe
+          if-no-files-found: error
+          retention-days: 30
