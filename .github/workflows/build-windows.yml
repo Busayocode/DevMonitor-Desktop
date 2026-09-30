@@ -1,4 +1,4 @@
-name: Build DevMonitor Windows Installer
+name: Build DevMonitor Windows Installer and Android APK
 
 on:
   workflow_dispatch:
@@ -11,56 +11,250 @@ permissions:
   contents: read
 
 jobs:
-  build-windows:
+  build-devmonitor:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '22'
 
-      - name: Extract desktop source
+      - name: Extract newest DevMonitor source ZIP
         shell: pwsh
         run: |
-          $archives = @(Get-ChildItem -Path . -Filter "*.zip" -File)
-          if ($archives.Count -ne 1) {
-            throw "Expected exactly one source ZIP; found $($archives.Count)."
-          }
-          Expand-Archive -LiteralPath $archives[0].FullName -DestinationPath "$env:GITHUB_WORKSPACE/desktop-source" -Force
+          $archives = @(git ls-files -- '*.zip' |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
 
-      - name: Install dependencies and build
+          if ($archives.Count -eq 0) {
+            throw "No source ZIP files found in the repository."
+          }
+
+          $archiveInfo = foreach ($path in $archives) {
+            $commitTime = git log -1 --format=%ct -- "$path"
+
+            if ($LASTEXITCODE -ne 0 -or -not $commitTime) {
+              throw "Could not determine the last update for $path."
+            }
+
+            [PSCustomObject]@{
+              Path = $path
+              CommitTime = [long]$commitTime
+            }
+          }
+
+          $selected = $archiveInfo |
+            Sort-Object -Property `
+              @{Expression='CommitTime';Descending=$true}, `
+              @{Expression='Path';Descending=$false} |
+            Select-Object -First 1
+
+          Write-Host "========================================="
+          Write-Host "Selected newest DevMonitor source ZIP"
+          Write-Host "========================================="
+          Write-Host "ZIP: $($selected.Path)"
+          Write-Host "Last updated (UTC): $([DateTimeOffset]::FromUnixTimeSeconds($selected.CommitTime).UtcDateTime)"
+          Write-Host "========================================="
+
+          $destination = "$env:GITHUB_WORKSPACE/devmonitor-source"
+
+          if (Test-Path $destination) {
+            Remove-Item -LiteralPath $destination -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+
+          Expand-Archive `
+            -LiteralPath (Join-Path $env:GITHUB_WORKSPACE $selected.Path) `
+            -DestinationPath $destination `
+            -Force
+
+      # ============================================================
+      # WINDOWS DESKTOP BUILD
+      # ============================================================
+
+      - name: Locate desktop package.json
+        id: desktop
         shell: pwsh
         run: |
-          $package = Get-ChildItem -Path "$env:GITHUB_WORKSPACE/desktop-source" -Filter "package.json" -Recurse -File | Select-Object -First 1
-          if (-not $package) {
-            throw "package.json not found in the extracted source."
-          }
-          Set-Location $package.DirectoryName
+          $package = Get-ChildItem `
+            -Path "$env:GITHUB_WORKSPACE/devmonitor-source" `
+            -Filter "package.json" `
+            -Recurse `
+            -File |
+            Where-Object {
+              Test-Path (Join-Path $_.DirectoryName "electron-builder.yml") -PathType Leaf -ErrorAction SilentlyContinue `
+              -or
+              Test-Path (Join-Path $_.DirectoryName "electron-builder.yaml") -PathType Leaf -ErrorAction SilentlyContinue `
+              -or
+              Test-Path (Join-Path $_.DirectoryName "electron-builder.json") -PathType Leaf -ErrorAction SilentlyContinue
+            } |
+            Select-Object -First 1
 
-          $packageJson = Get-Content -LiteralPath "package.json" -Raw | ConvertFrom-Json
+          if ($package) {
+            Write-Host "Desktop project found:"
+            Write-Host $package.FullName
+
+            "available=true" >> $env:GITHUB_OUTPUT
+            "path=$($package.DirectoryName)" >> $env:GITHUB_OUTPUT
+          }
+          else {
+            Write-Host "No Electron desktop project detected."
+            "available=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Install desktop dependencies and build
+        if: steps.desktop.outputs.available == 'true'
+        shell: pwsh
+        run: |
+          Set-Location "${{ steps.desktop.outputs.path }}"
+
+          $packageJson = Get-Content `
+            -LiteralPath "package.json" `
+            -Raw |
+            ConvertFrom-Json
+
           $electronVersion = $packageJson.dependencies.electron
+
           if ($electronVersion) {
             npm pkg set "devDependencies.electron=$electronVersion"
-            if ($LASTEXITCODE -ne 0) { throw "Could not move Electron to devDependencies." }
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not move Electron to devDependencies."
+            }
+
             npm pkg delete "dependencies.electron"
-            if ($LASTEXITCODE -ne 0) { throw "Could not remove Electron from dependencies." }
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not remove Electron from dependencies."
+            }
           }
 
           npm install --no-audit --no-fund
-          if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed." }
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Desktop dependency installation failed."
+          }
 
           npm run dist
-          if ($LASTEXITCODE -ne 0) { throw "Windows installer build failed." }
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows installer build failed."
+          }
+
+      # ============================================================
+      # ANDROID BUILD
+      # ============================================================
+
+      - name: Locate Android project
+        id: android
+        shell: pwsh
+        run: |
+          $gradleProject = Get-ChildItem `
+            -Path "$env:GITHUB_WORKSPACE/devmonitor-source" `
+            -Filter "gradlew.bat" `
+            -Recurse `
+            -File |
+            Select-Object -First 1
+
+          if ($gradleProject) {
+            Write-Host "Android project found:"
+            Write-Host $gradleProject.FullName
+
+            "available=true" >> $env:GITHUB_OUTPUT
+            "path=$($gradleProject.DirectoryName)" >> $env:GITHUB_OUTPUT
+          }
+          else {
+            Write-Host "No Android Gradle project detected."
+            "available=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Set up Java for Android
+        if: steps.android.outputs.available == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        if: steps.android.outputs.available == 'true'
+        uses: android-actions/setup-android@v3
+
+      - name: Build Android APK
+        if: steps.android.outputs.available == 'true'
+        shell: pwsh
+        run: |
+          Set-Location "${{ steps.android.outputs.path }}"
+
+          Write-Host "Building Android APK..."
+
+          if (Test-Path ".\gradlew.bat") {
+            & .\gradlew.bat assembleDebug --console=plain
+          }
+          else {
+            throw "Android Gradle wrapper was not found."
+          }
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Android APK build failed."
+          }
+
+      # ============================================================
+      # WINDOWS ARTIFACT
+      # ============================================================
 
       - name: Upload Windows installer
+        if: steps.desktop.outputs.available == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: DevMonitor-Windows-Installer
-          path: desktop-source/**/release/*.exe
+          path: devmonitor-source/**/release/*.exe
           if-no-files-found: error
           retention-days: 30
+
+      # ============================================================
+      # ANDROID ARTIFACT
+      # ============================================================
+
+      - name: Upload Android APK
+        if: steps.android.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: DevMonitor-Android-APK
+          path: devmonitor-source/**/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # ============================================================
+      # BUILD SUMMARY
+      # ============================================================
+
+      - name: Build summary
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "========================================="
+          Write-Host "DevMonitor build completed"
+          Write-Host "========================================="
+
+          if ("${{ steps.desktop.outputs.available }}" -eq "true") {
+            Write-Host "Windows: BUILD ATTEMPTED"
+          }
+          else {
+            Write-Host "Windows: NO DESKTOP PROJECT FOUND"
+          }
+
+          if ("${{ steps.android.outputs.available }}" -eq "true") {
+            Write-Host "Android: BUILD ATTEMPTED"
+          }
+          else {
+            Write-Host "Android: NO ANDROID PROJECT FOUND"
+          }
+
+          Write-Host "========================================="
