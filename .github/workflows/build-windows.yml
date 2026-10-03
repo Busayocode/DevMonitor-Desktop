@@ -1,5 +1,4 @@
-
-name: Build DevMonitor Windows Installer and Android APK
+name: Build DevMonitor Native Windows
 
 on:
   workflow_dispatch:
@@ -12,41 +11,30 @@ permissions:
   contents: read
 
 jobs:
-  build-devmonitor:
+  build-windows:
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     steps:
-      # ----------------------------------------------------------
-      # 1. CHECK OUT REPOSITORY
-      # ----------------------------------------------------------
-
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ----------------------------------------------------------
-      # 2. SET UP NODE.JS
-      # ----------------------------------------------------------
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
         with:
-          node-version: '22'
+          dotnet-version: '8.0.x'
 
-      # ----------------------------------------------------------
-      # 3. SELECT AND EXTRACT NEWEST SOURCE ZIP
-      # ----------------------------------------------------------
-
-      - name: Extract newest DevMonitor source ZIP
+      - name: Find newest DevMonitor Windows ZIP
         id: source
         shell: pwsh
         run: |
           $archives = @(
             git ls-files -- '*.zip' |
               Where-Object {
-                Test-Path -LiteralPath $_ -PathType Leaf
+                $_ -match 'DevMonitor.*Windows.*\.zip$' -and
+                (Test-Path -LiteralPath $_ -PathType Leaf)
               }
           )
 
@@ -55,7 +43,12 @@ jobs:
           }
 
           if ($archives.Count -eq 0) {
-            throw "No source ZIP files found in the repository."
+            throw "No DevMonitor Windows ZIP files were found."
+          }
+
+          Write-Host "Windows ZIP files found:"
+          $archives | ForEach-Object {
+            Write-Host " - $_"
           }
 
           $archiveInfo = @(
@@ -63,7 +56,7 @@ jobs:
               $commitTime = git log -1 --format=%ct -- "$path"
 
               if ($LASTEXITCODE -ne 0 -or -not $commitTime) {
-                throw "Could not determine the last update for $path."
+                throw "Could not determine the last update time for $path."
               }
 
               [PSCustomObject]@{
@@ -74,303 +67,225 @@ jobs:
           )
 
           $selected = $archiveInfo |
-            Sort-Object -Property `
-              @{Expression='CommitTime';Descending=$true}, `
-              @{Expression='Path';Descending=$false} |
+            Sort-Object `
+              -Property `
+                @{Expression='CommitTime';Descending=$true}, `
+                @{Expression='Path';Descending=$false} |
             Select-Object -First 1
 
           if (-not $selected) {
-            throw "Could not select a source ZIP."
+            throw "Could not select the newest Windows source ZIP."
           }
 
-          Write-Host "Selected source ZIP: $($selected.Path)"
-          Write-Host "Last updated (UTC): $([DateTimeOffset]::FromUnixTimeSeconds($selected.CommitTime).UtcDateTime)"
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "Selected Windows source:"
+          Write-Host $selected.Path
+          Write-Host "=========================================="
 
           "selected_zip=$($selected.Path)" >> $env:GITHUB_OUTPUT
 
+      - name: Extract Windows source
+        shell: pwsh
+        run: |
+          $sourceZip = "${{ steps.source.outputs.selected_zip }}"
           $destination = Join-Path $env:GITHUB_WORKSPACE "devmonitor-source"
 
           if (Test-Path -LiteralPath $destination) {
             Remove-Item -LiteralPath $destination -Recurse -Force
           }
 
-          New-Item -ItemType Directory -Path $destination -Force |
+          New-Item `
+            -ItemType Directory `
+            -Path $destination `
+            -Force |
             Out-Null
 
-          $zipPath = Join-Path $env:GITHUB_WORKSPACE $selected.Path
+          Write-Host "Extracting:"
+          Write-Host $sourceZip
 
           Expand-Archive `
-            -LiteralPath $zipPath `
+            -LiteralPath (Join-Path $env:GITHUB_WORKSPACE $sourceZip) `
             -DestinationPath $destination `
             -Force
 
-          Write-Host "Source extracted successfully."
+          Write-Host "Source extracted."
 
-      # ----------------------------------------------------------
-      # 4. LOCATE WINDOWS DESKTOP PROJECT
-      # ----------------------------------------------------------
-
-      - name: Locate desktop project
-        id: desktop
+      - name: Locate native Windows project
+        id: project
         shell: pwsh
         run: |
-          $packages = @(
+          $projects = @(
             Get-ChildItem `
               -Path "$env:GITHUB_WORKSPACE/devmonitor-source" `
-              -Filter "package.json" `
+              -Filter "*.csproj" `
               -Recurse `
               -File
           )
 
-          $package = $null
-
-          foreach ($candidate in $packages) {
-            $json = Get-Content `
-              -LiteralPath $candidate.FullName `
-              -Raw |
-              ConvertFrom-Json
-
-            $electron = $false
-            $builder = $false
-            $dist = $false
-
-            if ($json.dependencies) {
-              if ($json.dependencies.electron) {
-                $electron = $true
-              }
-              if ($json.dependencies.'electron-builder') {
-                $builder = $true
-              }
-            }
-
-            if ($json.devDependencies) {
-              if ($json.devDependencies.electron) {
-                $electron = $true
-              }
-              if ($json.devDependencies.'electron-builder') {
-                $builder = $true
-              }
-            }
-
-            if ($json.scripts -and $json.scripts.dist) {
-              $dist = $true
-            }
-
-            if ($electron -and $builder -and $dist) {
-              $package = $candidate
-              break
-            }
+          if ($projects.Count -eq 0) {
+            throw "No .csproj file was found in the Windows source ZIP."
           }
 
-          if ($package) {
-            Write-Host "Desktop project found:"
-            Write-Host $package.FullName
-
-            "available=true" >> $env:GITHUB_OUTPUT
-            "path=$($package.DirectoryName)" >> $env:GITHUB_OUTPUT
-          }
-          else {
-            Write-Host "No compatible Electron desktop project found."
-            "available=false" >> $env:GITHUB_OUTPUT
+          Write-Host "C# projects found:"
+          $projects | ForEach-Object {
+            Write-Host " - $($_.FullName)"
           }
 
-      # ----------------------------------------------------------
-      # 5. INSTALL AND BUILD WINDOWS DESKTOP
-      # ----------------------------------------------------------
+          $project = $projects |
+            Where-Object {
+              $_.Name -eq "DevMonitor.Windows.csproj"
+            } |
+            Select-Object -First 1
 
-      - name: Install desktop dependencies and build
-        if: steps.desktop.outputs.available == 'true'
+          if (-not $project) {
+            $project = $projects | Select-Object -First 1
+          }
+
+          Write-Host ""
+          Write-Host "Selected project:"
+          Write-Host $project.FullName
+
+          "path=$($project.FullName)" >> $env:GITHUB_OUTPUT
+          "directory=$($project.DirectoryName)" >> $env:GITHUB_OUTPUT
+
+      - name: Restore .NET project
         shell: pwsh
         run: |
-          Set-Location "${{ steps.desktop.outputs.path }}"
+          $project = "${{ steps.project.outputs.path }}"
 
-          $packageJson = Get-Content `
-            -LiteralPath "package.json" `
-            -Raw |
-            ConvertFrom-Json
+          Write-Host "Restoring:"
+          Write-Host $project
 
-          $electronVersion = $null
-
-          if ($packageJson.dependencies) {
-            $electronVersion = $packageJson.dependencies.electron
-          }
-
-          if (-not $electronVersion -and $packageJson.devDependencies) {
-            $electronVersion = $packageJson.devDependencies.electron
-          }
-
-          if ($electronVersion) {
-            npm pkg set "devDependencies.electron=$electronVersion"
-
-            if ($LASTEXITCODE -ne 0) {
-              throw "Could not configure Electron."
-            }
-
-            if ($packageJson.dependencies -and $packageJson.dependencies.electron) {
-              npm pkg delete "dependencies.electron"
-
-              if ($LASTEXITCODE -ne 0) {
-                throw "Could not remove Electron from dependencies."
-              }
-            }
-          }
-
-          npm install --no-audit --no-fund
+          dotnet restore "$project"
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Desktop dependency installation failed."
+            throw "dotnet restore failed."
           }
 
-          npm run dist
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Windows installer build failed."
-          }
-
-      # ----------------------------------------------------------
-      # 6. LOCATE ANDROID PROJECT
-      # ----------------------------------------------------------
-
-      - name: Locate Android project
-        id: android
+      - name: Build and publish Windows EXE
         shell: pwsh
         run: |
-          $gradleProjects = @(
-            Get-ChildItem `
-              -Path "$env:GITHUB_WORKSPACE/devmonitor-source" `
-              -Filter "gradlew" `
-              -Recurse `
-              -File
-          )
+          $project = "${{ steps.project.outputs.path }}"
+          $output = Join-Path $env:GITHUB_WORKSPACE "windows-publish"
 
-          $gradleProject = $null
-
-          foreach ($candidate in $gradleProjects) {
-            $directory = $candidate.DirectoryName
-
-            $settings = Test-Path `
-              -LiteralPath (Join-Path $directory "settings.gradle") `
-              -PathType Leaf
-
-            $settingsKts = Test-Path `
-              -LiteralPath (Join-Path $directory "settings.gradle.kts") `
-              -PathType Leaf
-
-            if ($settings -or $settingsKts) {
-              $gradleProject = $candidate
-              break
-            }
+          if (Test-Path -LiteralPath $output) {
+            Remove-Item -LiteralPath $output -Recurse -Force
           }
 
-          if ($gradleProject) {
-            Write-Host "Android Gradle project found:"
-            Write-Host $gradleProject.FullName
+          New-Item `
+            -ItemType Directory `
+            -Path $output `
+            -Force |
+            Out-Null
 
-            "available=true" >> $env:GITHUB_OUTPUT
-            "path=$($gradleProject.DirectoryName)" >> $env:GITHUB_OUTPUT
-          }
-          else {
-            Write-Host "No Android Gradle project found."
-            "available=false" >> $env:GITHUB_OUTPUT
-          }
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "Publishing DevMonitor for Windows x64"
+          Write-Host "=========================================="
 
-      # ----------------------------------------------------------
-      # 7. SET UP JAVA
-      # ----------------------------------------------------------
-
-      - name: Set up Java for Android
-        if: steps.android.outputs.available == 'true'
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      # ----------------------------------------------------------
-      # 8. SET UP ANDROID SDK
-      # ----------------------------------------------------------
-
-      - name: Set up Android SDK
-        if: steps.android.outputs.available == 'true'
-        uses: android-actions/setup-android@v3
-
-      # ----------------------------------------------------------
-      # 9. BUILD ANDROID APK
-      # ----------------------------------------------------------
-
-      - name: Build Android APK
-        if: steps.android.outputs.available == 'true'
-        shell: pwsh
-        run: |
-          Set-Location "${{ steps.android.outputs.path }}"
-
-          if (-not (Test-Path -LiteralPath ".\gradlew.bat")) {
-            throw "Windows Gradle wrapper gradlew.bat not found."
-          }
-
-          & .\gradlew.bat assembleDebug --console=plain
+          dotnet publish "$project" `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -o "$output"
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Android APK build failed."
+            throw "Windows publish failed."
           }
 
-          Write-Host "Android APK build completed."
+          Write-Host ""
+          Write-Host "Published files:"
+          Get-ChildItem `
+            -Path $output `
+            -Recurse `
+            -File |
+            ForEach-Object {
+              Write-Host " - $($_.FullName)"
+            }
 
-      # ----------------------------------------------------------
-      # 10. UPLOAD WINDOWS INSTALLER
-      # ----------------------------------------------------------
+      - name: Verify Windows EXE
+        shell: pwsh
+        run: |
+          $publish = Join-Path $env:GITHUB_WORKSPACE "windows-publish"
 
-      - name: Upload Windows installer
-        if: steps.desktop.outputs.available == 'true'
+          $exe = Get-ChildItem `
+            -Path $publish `
+            -Filter "*.exe" `
+            -Recurse `
+            -File |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            throw "No Windows EXE was produced."
+          }
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "EXE BUILD SUCCESSFUL"
+          Write-Host "=========================================="
+          Write-Host "EXE:"
+          Write-Host $exe.FullName
+          Write-Host "Size:"
+          Write-Host "$([math]::Round($exe.Length / 1MB, 2)) MB"
+
+      - name: Create ZIP package
+        shell: pwsh
+        run: |
+          $publish = Join-Path $env:GITHUB_WORKSPACE "windows-publish"
+          $package = Join-Path $env:GITHUB_WORKSPACE "DevMonitor-Windows-x64.zip"
+
+          if (Test-Path -LiteralPath $package) {
+            Remove-Item -LiteralPath $package -Force
+          }
+
+          Compress-Archive `
+            -Path "$publish\*" `
+            -DestinationPath $package `
+            -Force
+
+          Write-Host "Created:"
+          Write-Host $package
+
+      - name: Upload Windows EXE artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DevMonitor-Windows-Installer
-          path: devmonitor-source/**/release/*.exe
+          name: DevMonitor-Windows-x64
+          path: windows-publish/*.exe
           if-no-files-found: error
           retention-days: 30
 
-      # ----------------------------------------------------------
-      # 11. UPLOAD ANDROID APK
-      # ----------------------------------------------------------
-
-      - name: Upload Android APK
-        if: steps.android.outputs.available == 'true'
+      - name: Upload complete Windows package
         uses: actions/upload-artifact@v4
         with:
-          name: DevMonitor-Android-APK
-          path: devmonitor-source/**/build/outputs/apk/**/*.apk
+          name: DevMonitor-Windows-x64-Full
+          path: DevMonitor-Windows-x64.zip
           if-no-files-found: error
           retention-days: 30
-
-      # ----------------------------------------------------------
-      # 12. BUILD SUMMARY
-      # ----------------------------------------------------------
 
       - name: Build summary
         if: always()
         shell: pwsh
         env:
-          DESKTOP_STATUS: ${{ steps.desktop.outputs.available }}
-          ANDROID_STATUS: ${{ steps.android.outputs.available }}
           SOURCE_ZIP: ${{ steps.source.outputs.selected_zip }}
         run: |
           Write-Host ""
           Write-Host "=========================================="
-          Write-Host "DEVMonitor BUILD SUMMARY"
+          Write-Host "DEVMonitor Native Windows BUILD SUMMARY"
           Write-Host "=========================================="
-          Write-Host "Source ZIP: $env:SOURCE_ZIP"
-
-          if ($env:DESKTOP_STATUS -eq "true") {
-            Write-Host "Windows: Build configured"
-          }
-          else {
-            Write-Host "Windows: No desktop project detected"
-          }
-
-          if ($env:ANDROID_STATUS -eq "true") {
-            Write-Host "Android: Build configured"
-          }
-          else {
-            Write-Host "Android: No Android project detected"
-          }
-
+          Write-Host "Source ZIP:"
+          Write-Host $env:SOURCE_ZIP
+          Write-Host ""
+          Write-Host "Target: Windows x64"
+          Write-Host "Runtime: .NET 8"
+          Write-Host "Application: Native WPF"
+          Write-Host "Self-contained: Yes"
+          Write-Host "Single-file EXE: Yes"
+          Write-Host ""
+          Write-Host "Artifacts:"
+          Write-Host " - DevMonitor-Windows-x64"
+          Write-Host " - DevMonitor-Windows-x64-Full"
           Write-Host "=========================================="
