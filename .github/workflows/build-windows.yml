@@ -21,43 +21,21 @@ jobs:
 
     steps:
 
-      # ------------------------------------------------------------
-      # 1. Checkout the complete repository
-      # ------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-
-      # ------------------------------------------------------------
-      # 2. Find the source ZIP
-      #
-      # Priority:
-      #   A. ZIP changed in the current commit
-      #   B. Otherwise use the newest DevMonitor Windows ZIP
-      #
-      # This allows the workflow file itself to be committed without
-      # causing the build to fail.
-      # ------------------------------------------------------------
       - name: Find DevMonitor source ZIP
         id: source
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host ""
-          Write-Host "============================================"
-          Write-Host "Finding DevMonitor source ZIP"
-          Write-Host "============================================"
-          Write-Host ""
+          Write-Host "Finding DevMonitor Windows ZIP..."
 
           $sha = "${{ github.sha }}"
 
-          # --------------------------------------------------------
-          # First: look for a DevMonitor Windows ZIP changed in
-          # the commit that triggered this workflow.
-          # --------------------------------------------------------
           $changed = @(
             git diff-tree `
               --no-commit-id `
@@ -68,17 +46,6 @@ jobs:
               -- '*.zip'
           )
 
-          Write-Host "ZIP files changed in this commit:"
-          
-          if ($changed.Count -eq 0) {
-            Write-Host "  None"
-          }
-          else {
-            $changed | ForEach-Object {
-              Write-Host "  $_"
-            }
-          }
-
           $changedWindowsZips = @(
             $changed |
             Where-Object {
@@ -86,23 +53,9 @@ jobs:
             }
           )
 
-          # --------------------------------------------------------
-          # If this commit contains a new/changed DevMonitor ZIP,
-          # use it.
-          # --------------------------------------------------------
           if ($changedWindowsZips.Count -gt 0) {
 
-            if ($changedWindowsZips.Count -gt 1) {
-              Write-Host ""
-              Write-Host "Multiple DevMonitor Windows ZIPs changed."
-              Write-Host "Using the last one returned by Git:"
-              $changedWindowsZips | ForEach-Object {
-                Write-Host "  $_"
-              }
-            }
-
             $relativePath = $changedWindowsZips[-1]
-
             $zipPath = $relativePath -replace '/', '\'
 
             if (-not (Test-Path -LiteralPath $zipPath)) {
@@ -111,22 +64,14 @@ jobs:
 
             $zipFullPath = (Resolve-Path -LiteralPath $zipPath).Path
 
-            Write-Host ""
-            Write-Host "A DevMonitor ZIP was changed by this commit."
-            Write-Host "Using:"
-            Write-Host "  $zipFullPath"
-          }
+            Write-Host "Using ZIP changed by this commit:"
+            Write-Host $zipFullPath
 
-          # --------------------------------------------------------
-          # Otherwise this was probably a workflow/manual run.
-          # Find all existing DevMonitor Windows ZIPs.
-          # --------------------------------------------------------
+          }
           else {
 
-            Write-Host ""
-            Write-Host "No DevMonitor Windows ZIP was changed by this commit."
-            Write-Host "Searching the repository for an existing source ZIP..."
-            Write-Host ""
+            Write-Host "No ZIP changed by this commit."
+            Write-Host "Finding latest existing DevMonitor Windows ZIP..."
 
             $existingZips = @(
               Get-ChildItem `
@@ -140,18 +85,11 @@ jobs:
             )
 
             if ($existingZips.Count -eq 0) {
-              throw "No DevMonitor Windows ZIP exists in the repository."
+              throw "No DevMonitor Windows ZIP was found."
             }
 
-            Write-Host "Existing DevMonitor Windows ZIPs:"
-            $existingZips | ForEach-Object {
-              Write-Host "  $($_.FullName)"
-            }
-
-            # Use Git's commit history to determine which ZIP is
-            # newest in the repository rather than relying on the
-            # Windows filesystem timestamp.
-            $latestCommitInfo = @()
+            $latest = $null
+            $latestDate = 0
 
             foreach ($file in $existingZips) {
 
@@ -165,49 +103,35 @@ jobs:
                 -- "$relative"
 
               if ($commitDate) {
-                $latestCommitInfo += [PSCustomObject]@{
-                  Path = $file.FullName
-                  Date = [int64]$commitDate
+                $commitDate = [int64]$commitDate
+
+                if ($commitDate -gt $latestDate) {
+                  $latestDate = $commitDate
+                  $latest = $file.FullName
                 }
               }
             }
 
-            if ($latestCommitInfo.Count -eq 0) {
-              throw "Unable to determine the latest DevMonitor Windows ZIP."
+            if (-not $latest) {
+              throw "Unable to determine latest DevMonitor Windows ZIP."
             }
 
-            $selected = $latestCommitInfo |
-              Sort-Object Date -Descending |
-              Select-Object -First 1
+            $zipFullPath = $latest
 
-            $zipFullPath = $selected.Path
-
-            Write-Host ""
-            Write-Host "Using latest existing DevMonitor Windows ZIP:"
-            Write-Host "  $zipFullPath"
+            Write-Host "Using latest existing ZIP:"
+            Write-Host $zipFullPath
           }
 
           $zipName = Split-Path $zipFullPath -Leaf
 
-          Write-Host ""
-          Write-Host "============================================"
-          Write-Host "Selected source"
-          Write-Host "============================================"
-          Write-Host ""
-          Write-Host "ZIP:"
-          Write-Host "  $zipName"
-          Write-Host ""
-          Write-Host "Path:"
-          Write-Host "  $zipFullPath"
-          Write-Host ""
-
           "zip_path=$zipFullPath" >> $env:GITHUB_OUTPUT
           "zip_name=$zipName" >> $env:GITHUB_OUTPUT
 
+          Write-Host ""
+          Write-Host "Source ZIP:"
+          Write-Host $zipName
 
-      # ------------------------------------------------------------
-      # 3. Extract source ZIP
-      # ------------------------------------------------------------
+
       - name: Extract source ZIP
         id: extract
         shell: powershell
@@ -225,23 +149,16 @@ jobs:
             -ItemType Directory `
             -Path $extractDir | Out-Null
 
-          Write-Host "Extracting:"
-          Write-Host "  $zip"
-          Write-Host ""
-
           Expand-Archive `
             -LiteralPath $zip `
             -DestinationPath $extractDir `
             -Force
 
-          Write-Host "Extraction complete."
-
           "extract_dir=$extractDir" >> $env:GITHUB_OUTPUT
 
+          Write-Host "Source extracted."
 
-      # ------------------------------------------------------------
-      # 4. Locate native WPF project
-      # ------------------------------------------------------------
+
       - name: Locate Windows project
         id: project
         shell: powershell
@@ -259,34 +176,25 @@ jobs:
           )
 
           if ($projects.Count -eq 0) {
-            throw "DevMonitor.Windows.csproj was not found in the uploaded ZIP."
+            throw "DevMonitor.Windows.csproj was not found."
           }
 
-          $projectPath = $projects[0].FullName
-          $projectDir = $projects[0].Directory.FullName
+          $project = $projects[0]
 
-          Write-Host ""
-          Write-Host "Windows project:"
-          Write-Host "  $projectPath"
-          Write-Host ""
+          "project_path=$($project.FullName)" >> $env:GITHUB_OUTPUT
+          "project_dir=$($project.Directory.FullName)" >> $env:GITHUB_OUTPUT
 
-          "project_path=$projectPath" >> $env:GITHUB_OUTPUT
-          "project_dir=$projectDir" >> $env:GITHUB_OUTPUT
+          Write-Host "Project:"
+          Write-Host $project.FullName
 
 
-      # ------------------------------------------------------------
-      # 5. Setup .NET 8
-      # ------------------------------------------------------------
       - name: Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
 
 
-      # ------------------------------------------------------------
-      # 6. Determine application version
-      # ------------------------------------------------------------
-      - name: Determine build version
+      - name: Determine version
         id: version
         shell: powershell
         run: |
@@ -294,57 +202,34 @@ jobs:
 
           $zipName = "${{ steps.source.outputs.zip_name }}"
 
-          Write-Host "Source ZIP:"
-          Write-Host "  $zipName"
-          Write-Host ""
-
-          # Look for a normal semantic version first.
-          #
-          # Examples:
-          #   4.6.0.181
-          #   4.3.5.59
-          #   4.4.0
-          #
           $match = [regex]::Match(
             $zipName,
             '(?i)(\d+\.\d+\.\d+(?:\.\d+)?)'
           )
 
           if ($match.Success) {
-
             $version = $match.Groups[1].Value
-
           }
           else {
 
-            # Fall back to a simple v181 style number.
             $match = [regex]::Match(
               $zipName,
               '(?i)v(\d+)'
             )
 
             if ($match.Success) {
-
               $version = "0.0.$($match.Groups[1].Value)"
-
             }
             else {
-
               $version = "0.0.${{ github.run_number }}"
-
             }
           }
 
-          Write-Host "Detected version:"
-          Write-Host "  $version"
-          Write-Host ""
-
           "version=$version" >> $env:GITHUB_OUTPUT
 
+          Write-Host "Version: $version"
 
-      # ------------------------------------------------------------
-      # 7. Restore
-      # ------------------------------------------------------------
+
       - name: Restore project
         shell: powershell
         run: |
@@ -354,9 +239,6 @@ jobs:
             "${{ steps.project.outputs.project_path }}"
 
 
-      # ------------------------------------------------------------
-      # 8. Publish self-contained Windows application
-      # ------------------------------------------------------------
       - name: Publish Windows application
         id: publish
         shell: powershell
@@ -388,23 +270,11 @@ jobs:
             throw "dotnet publish failed."
           }
 
-          Write-Host ""
-          Write-Host "Publish completed."
-          Write-Host ""
-
-          Get-ChildItem `
-            $publish `
-            -Recurse |
-          ForEach-Object {
-            Write-Host "  $($_.FullName)"
-          }
-
           "publish_dir=$publish" >> $env:GITHUB_OUTPUT
 
+          Write-Host "Windows publish completed."
 
-      # ------------------------------------------------------------
-      # 9. Install Inno Setup
-      # ------------------------------------------------------------
+
       - name: Install Inno Setup
         shell: powershell
         run: |
@@ -418,24 +288,18 @@ jobs:
             throw "Inno Setup compiler was not found."
           }
 
-          Write-Host "Inno Setup ready."
+          Write-Host "Inno Setup installed."
 
 
-      # ------------------------------------------------------------
-      # 10. Build normal Windows installer
-      # ------------------------------------------------------------
-      - name: Build Windows installer
-        id: installer
+      - name: Create installer script
+        id: installer_script
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
           $projectDir = "${{ steps.project.outputs.project_dir }}"
           $publishDir = "${{ steps.publish.outputs.publish_dir }}"
-
-          $installerDir = Join-Path `
-            $env:RUNNER_TEMP `
-            "DevMonitorInstaller"
+          $installerDir = Join-Path $env:RUNNER_TEMP "DevMonitorInstaller"
 
           if (Test-Path $installerDir) {
             Remove-Item $installerDir -Recurse -Force
@@ -445,29 +309,20 @@ jobs:
             -ItemType Directory `
             -Path $installerDir | Out-Null
 
-          # --------------------------------------------------------
-          # Use the supplied DevMonitor icon.
-          # --------------------------------------------------------
-          $icon = Join-Path `
-            $projectDir `
-            "Assets\DevMonitor.ico"
+          $icon = Join-Path $projectDir "Assets\DevMonitor.ico"
 
           if (-not (Test-Path $icon)) {
-            throw "DevMonitor.ico was not found: $icon"
+            throw "DevMonitor.ico was not found."
           }
 
           $version = "${{ steps.version.outputs.version }}"
-          $run = "${{ github.run_number }}"
+          $runNumber = "${{ github.run_number }}"
 
-          $setupBaseName = "DevMonitor-Setup-v$version-Run-$run"
+          $setupName = "DevMonitor-Setup-v$version-Run-$runNumber"
 
           $iss = Join-Path `
             $env:RUNNER_TEMP `
             "DevMonitor.iss"
-
-          $escapedPublish = $publishDir.Replace('\', '\\')
-          $escapedIcon = $icon.Replace('\', '\\')
-          $escapedOutput = $installerDir.Replace('\', '\\')
 
           $script = @"
 #define MyAppName "DevMonitor"
@@ -480,50 +335,34 @@ AppId={{7D1D1F54-8E9E-4D25-B4A7-DEV-MONITOR}}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-
 DefaultDirName={autopf}\DevMonitor
 DefaultGroupName=DevMonitor
-
-OutputDir=$escapedOutput
-OutputBaseFilename=$setupBaseName
-
+OutputDir=$installerDir
+OutputBaseFilename=$setupName
 ArchitecturesInstallIn64BitMode=x64compatible
 ArchitecturesAllowed=x64compatible
-
 Compression=lzma2
 SolidCompression=yes
-
 WizardStyle=modern
-
-SetupIconFile=$escapedIcon
+SetupIconFile=$icon
 UninstallDisplayIcon={app}\DevMonitor.exe
-
 PrivilegesRequired=admin
 
 [Files]
-Source: "$escapedPublish\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "$publishDir\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\DevMonitor"; Filename: "{app}\DevMonitor.exe"
 Name: "{autodesktop}\DevMonitor"; Filename: "{app}\DevMonitor.exe"; Tasks: desktopicon
 
 [Tasks]
-Name: "desktopicon"
-Description: "Create a desktop shortcut"
-GroupDescription: "Additional icons:"
-Flags: unchecked
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
 
 [Dirs]
 Name: "{localappdata}\DevMonitor"
 
 [Run]
-Filename: "{app}\DevMonitor.exe"
-Description: "Launch DevMonitor"
-Flags: nowait postinstall skipifsilent
-
-[UninstallDelete]
-Type: filesandordirs
-Name: "{localappdata}\DevMonitor"
+Filename: "{app}\DevMonitor.exe"; Description: "Launch DevMonitor"; Flags: nowait postinstall skipifsilent
 "@
 
           Set-Content `
@@ -531,11 +370,21 @@ Name: "{localappdata}\DevMonitor"
             -Value $script `
             -Encoding UTF8
 
-          Write-Host ""
-          Write-Host "Compiling installer..."
-          Write-Host ""
+          "iss_path=$iss" >> $env:GITHUB_OUTPUT
+          "installer_dir=$installerDir" >> $env:GITHUB_OUTPUT
+
+          Write-Host "Installer script created."
+
+
+      - name: Build Windows installer
+        id: installer
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
 
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          $iss = "${{ steps.installer_script.outputs.iss_path }}"
+          $installerDir = "${{ steps.installer_script.outputs.installer_dir }}"
 
           & $iscc $iss
 
@@ -543,28 +392,24 @@ Name: "{localappdata}\DevMonitor"
             throw "Inno Setup failed with exit code $LASTEXITCODE"
           }
 
+          $version = "${{ steps.version.outputs.version }}"
+          $runNumber = "${{ github.run_number }}"
+
           $installerPath = Join-Path `
             $installerDir `
-            "$setupBaseName.exe"
+            "DevMonitor-Setup-v$version-Run-$runNumber.exe"
 
           if (-not (Test-Path $installerPath)) {
-            throw "Installer was not created: $installerPath"
+            throw "Installer was not created."
           }
-
-          Write-Host ""
-          Write-Host "============================================"
-          Write-Host "INSTALLER CREATED"
-          Write-Host "============================================"
-          Write-Host ""
-          Write-Host $installerPath
-          Write-Host ""
 
           "installer_path=$installerPath" >> $env:GITHUB_OUTPUT
 
+          Write-Host ""
+          Write-Host "INSTALLER CREATED:"
+          Write-Host $installerPath
 
-      # ------------------------------------------------------------
-      # 11. Create portable package as an additional artifact
-      # ------------------------------------------------------------
+
       - name: Create Windows package ZIP
         id: package
         shell: powershell
@@ -586,19 +431,11 @@ Name: "{localappdata}\DevMonitor"
             -DestinationPath $packageZip `
             -CompressionLevel Optimal
 
-          Write-Host ""
-          Write-Host "Package created:"
-          Write-Host "  $packageZip"
-
           "package_zip=$packageZip" >> $env:GITHUB_OUTPUT
 
+          Write-Host "Package ZIP created."
 
-      # ------------------------------------------------------------
-      # 12. Upload installer
-      #
-      # Every workflow run receives a unique artifact name.
-      # Older artifacts are NOT replaced.
-      # ------------------------------------------------------------
+
       - name: Upload Windows installer
         uses: actions/upload-artifact@v4
         with:
@@ -608,9 +445,6 @@ Name: "{localappdata}\DevMonitor"
           retention-days: 90
 
 
-      # ------------------------------------------------------------
-      # 13. Upload application package
-      # ------------------------------------------------------------
       - name: Upload Windows package
         uses: actions/upload-artifact@v4
         with:
@@ -620,30 +454,23 @@ Name: "{localappdata}\DevMonitor"
           retention-days: 90
 
 
-      # ------------------------------------------------------------
-      # 14. Final build summary
-      # ------------------------------------------------------------
       - name: Build summary
         shell: powershell
         run: |
           Write-Host ""
-          Write-Host "======================================================"
+          Write-Host "=============================================="
           Write-Host " DevMonitor Windows Build Completed"
-          Write-Host "======================================================"
+          Write-Host "=============================================="
           Write-Host ""
-          Write-Host "Source:"
-          Write-Host "  ${{ steps.source.outputs.zip_name }}"
+          Write-Host "Source ZIP:"
+          Write-Host "${{ steps.source.outputs.zip_name }}"
           Write-Host ""
           Write-Host "Version:"
-          Write-Host "  ${{ steps.version.outputs.version }}"
+          Write-Host "${{ steps.version.outputs.version }}"
           Write-Host ""
-          Write-Host "GitHub Run:"
-          Write-Host "  ${{ github.run_number }}"
+          Write-Host "Run:"
+          Write-Host "${{ github.run_number }}"
           Write-Host ""
-          Write-Host "Installer:"
-          Write-Host "  DevMonitor-Setup-v${{ steps.version.outputs.version }}-Run-${{ github.run_number }}.exe"
+          Write-Host "Previous ZIPs were not modified."
+          Write-Host "Previous build artifacts were not replaced."
           Write-Host ""
-          Write-Host "Previous source ZIPs remain untouched."
-          Write-Host "Previous build artifacts remain separate."
-          Write-Host ""
-          Write-Host "======================================================"
