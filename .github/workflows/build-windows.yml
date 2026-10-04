@@ -26,7 +26,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Find DevMonitor source ZIP
+      - name: Find available DevMonitor source ZIP
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -35,59 +35,120 @@ jobs:
           Write-Host "Finding DevMonitor source ZIP"
           Write-Host "============================================"
 
-          $changedFiles = git diff-tree --no-commit-id --name-only -r $env:GITHUB_SHA
+          $allZips = Get-ChildItem `
+            -Path $env:GITHUB_WORKSPACE `
+            -Filter "*.zip" `
+            -Recurse `
+            -File
 
-          $changedZip = $changedFiles |
+          $devMonitorZips = @(
+            $allZips |
             Where-Object {
-              $_ -match '\.zip$' -and
-              $_ -match 'DevMonitor'
+              $_.Name -match "DevMonitor" -and
+              $_.Name -notmatch "Windows-Installer" -and
+              $_.Name -notmatch "Windows-Package"
+            }
+          )
+
+          if ($devMonitorZips.Count -eq 0) {
+            throw "No DevMonitor source ZIP exists in the current repository checkout."
+          }
+
+          Write-Host ""
+          Write-Host "DevMonitor ZIP files currently available:"
+          Write-Host ""
+
+          foreach ($item in $devMonitorZips) {
+            Write-Host " - $($item.FullName)"
+          }
+
+          Write-Host ""
+
+          $changedFiles = git diff-tree `
+            --no-commit-id `
+            --name-only `
+            -r `
+            $env:GITHUB_SHA
+
+          $changedZipName = $changedFiles |
+            Where-Object {
+              $_ -match "\.zip$" -and
+              $_ -match "DevMonitor"
             } |
             Select-Object -First 1
 
-          if ($changedZip) {
-            Write-Host "Using ZIP changed by this commit:"
-            Write-Host $changedZip
-            "SOURCE_ZIP=$changedZip" >> $env:GITHUB_ENV
-          }
-          else {
-            Write-Host "No DevMonitor ZIP changed in this commit."
-            Write-Host "Searching repository history for latest DevMonitor ZIP."
+          $selectedZip = $null
 
-            $latestZip = git log --all --name-only --pretty=format: -- '*.zip' |
-              Where-Object {
-                $_ -match 'DevMonitor' -and $_ -match '\.zip$'
-              } |
-              Select-Object -First 1
+          if ($changedZipName) {
+            $candidatePath = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              $changedZipName
 
-            if (-not $latestZip) {
-              throw "No DevMonitor ZIP was found in repository history."
+            if (Test-Path $candidatePath) {
+              $selectedZip = Get-Item $candidatePath
+              Write-Host "Using DevMonitor ZIP changed by this commit:"
+              Write-Host $selectedZip.FullName
             }
-
-            Write-Host "Using latest historical ZIP:"
-            Write-Host $latestZip
-            "SOURCE_ZIP=$latestZip" >> $env:GITHUB_ENV
           }
+
+          if (-not $selectedZip) {
+            Write-Host "No usable DevMonitor ZIP was changed by this commit."
+            Write-Host "Selecting the newest DevMonitor ZIP that actually exists."
+
+            $selectedZip = $devMonitorZips |
+              Sort-Object LastWriteTime -Descending |
+              Select-Object -First 1
+          }
+
+          if (-not $selectedZip) {
+            throw "Unable to select an existing DevMonitor source ZIP."
+          }
+
+          Write-Host ""
+          Write-Host "============================================"
+          Write-Host "Selected source ZIP:"
+          Write-Host $selectedZip.FullName
+          Write-Host "============================================"
+          Write-Host ""
+
+          "SOURCE_ZIP=$($selectedZip.FullName)" >> $env:GITHUB_ENV
+          "SOURCE_ZIP_NAME=$($selectedZip.Name)" >> $env:GITHUB_ENV
 
       - name: Extract source ZIP
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $zip = $env:SOURCE_ZIP
-
-          if (-not (Test-Path $zip)) {
-            throw "Source ZIP was not found: $zip"
+          if (-not (Test-Path $env:SOURCE_ZIP)) {
+            throw "Source ZIP was not found: $env:SOURCE_ZIP"
           }
 
           Write-Host "Extracting:"
-          Write-Host $zip
+          Write-Host $env:SOURCE_ZIP
 
-          New-Item -ItemType Directory -Force -Path "source" | Out-Null
+          $extractDir = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "source"
+
+          if (Test-Path $extractDir) {
+            Remove-Item `
+              $extractDir `
+              -Recurse `
+              -Force
+          }
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $extractDir |
+            Out-Null
 
           Expand-Archive `
-            -Path $zip `
-            -DestinationPath "source" `
+            -Path $env:SOURCE_ZIP `
+            -DestinationPath $extractDir `
             -Force
+
+          Write-Host "Extraction completed."
 
       - name: Locate Windows project
         shell: pwsh
@@ -95,17 +156,28 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $project = Get-ChildItem `
-            -Path "source" `
+            -Path (Join-Path $env:GITHUB_WORKSPACE "source") `
             -Filter "DevMonitor.Windows.csproj" `
             -Recurse `
             -File |
             Select-Object -First 1
 
           if (-not $project) {
+            Write-Host ""
+            Write-Host "Files found inside source:"
+            Get-ChildItem `
+              -Path (Join-Path $env:GITHUB_WORKSPACE "source") `
+              -Recurse `
+              -File |
+              Select-Object -First 100 FullName |
+              ForEach-Object {
+                Write-Host $_.FullName
+              }
+
             throw "DevMonitor.Windows.csproj was not found inside the source ZIP."
           }
 
-          Write-Host "Project found:"
+          Write-Host "Windows project found:"
           Write-Host $project.FullName
 
           "PROJECT_FILE=$($project.FullName)" >> $env:GITHUB_ENV
@@ -114,17 +186,23 @@ jobs:
       - name: Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
+          dotnet-version: "8.0.x"
 
       - name: Determine build version
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $zipName = Split-Path $env:SOURCE_ZIP -Leaf
+          $zipName = $env:SOURCE_ZIP_NAME
 
-          if ($zipName -match '(\d+\.\d+\.\d+\.\d+)') {
+          Write-Host "Source ZIP:"
+          Write-Host $zipName
+
+          if ($zipName -match "(\d+\.\d+\.\d+\.\d+)") {
             $version = $Matches[1]
+          }
+          elseif ($zipName -match "v(\d+)") {
+            $version = "0.0.$($Matches[1]).0"
           }
           else {
             $version = "1.0.0.0"
@@ -146,10 +224,15 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $publishDir = Join-Path $env:GITHUB_WORKSPACE "publish"
+          $publishDir = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "publish"
 
           if (Test-Path $publishDir) {
-            Remove-Item $publishDir -Recurse -Force
+            Remove-Item `
+              $publishDir `
+              -Recurse `
+              -Force
           }
 
           dotnet publish "$env:PROJECT_FILE" `
@@ -162,17 +245,22 @@ jobs:
             -p:EnableCompressionInSingleFile=true `
             -p:Version="$env:BUILD_VERSION"
 
+          if ($LASTEXITCODE -ne 0) {
+            throw "dotnet publish failed."
+          }
+
       - name: Verify published application
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
           $exe = Get-ChildItem `
-            -Path "publish" `
+            -Path (Join-Path $env:GITHUB_WORKSPACE "publish") `
             -Filter "*.exe" `
             -File |
             Where-Object {
-              $_.Name -notmatch "setup|unins"
+              $_.Name -notmatch "setup" -and
+              $_.Name -notmatch "unins"
             } |
             Select-Object -First 1
 
@@ -197,44 +285,55 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $scriptPath = Join-Path $env:GITHUB_WORKSPACE "DevMonitorInstaller.iss"
+          $scriptPath = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "DevMonitorInstaller.iss"
 
-          $sourceDir = Join-Path $env:GITHUB_WORKSPACE "publish"
-          $outputDir = Join-Path $env:GITHUB_WORKSPACE "installer"
+          $sourceDir = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "publish"
 
-          New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+          $outputDir = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "installer"
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $outputDir |
+            Out-Null
 
           $iss = @"
-          [Setup]
-          AppId={{9F55A2C7-4F8B-4B9B-9A75-DEV-MONITOR}}
-          AppName=DevMonitor
-          AppVersion=$env:BUILD_VERSION
-          AppPublisher=DevMonitor
-          DefaultDirName={autopf}\DevMonitor
-          DefaultGroupName=DevMonitor
-          UninstallDisplayName=DevMonitor
-          OutputDir=$outputDir
-          OutputBaseFilename=DevMonitor-Setup-$env:BUILD_VERSION
-          Compression=lzma
-          SolidCompression=yes
-          ArchitecturesInstallIn64BitMode=x64compatible
-          PrivilegesRequired=admin
-          DisableProgramGroupPage=yes
-          WizardStyle=modern
+[Setup]
+AppId={{9F55A2C7-4F8B-4B9B-9A75-DEV-MONITOR}}
+AppName=DevMonitor
+AppVersion=$env:BUILD_VERSION
+AppPublisher=DevMonitor
+DefaultDirName={autopf}\DevMonitor
+DefaultGroupName=DevMonitor
+UninstallDisplayName=DevMonitor
+OutputDir=$outputDir
+OutputBaseFilename=DevMonitor-Setup-$env:BUILD_VERSION
+Compression=lzma
+SolidCompression=yes
+ArchitecturesInstallIn64BitMode=x64compatible
+PrivilegesRequired=admin
+DisableProgramGroupPage=yes
+WizardStyle=modern
 
-          [Files]
-          Source: "$sourceDir\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
+[Files]
+Source: "$sourceDir\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 
-          [Icons]
-          Name: "{group}\DevMonitor"; Filename: "{app}\DevMonitor.exe"
-          Name: "{autodesktop}\DevMonitor"; Filename: "{app}\DevMonitor.exe"; Tasks: desktopicon
+[Icons]
+Name: "{group}\DevMonitor"; Filename: "{app}\DevMonitor.exe"
+Name: "{autodesktop}\DevMonitor"; Filename: "{app}\DevMonitor.exe"; Tasks: desktopicon
 
-          [Tasks]
-          Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"
+[Tasks]
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"
 
-          [Run]
-          Filename: "{app}\DevMonitor.exe"; Description: "Launch DevMonitor"; Flags: nowait postinstall skipifsilent
-          "@
+[Run]
+Filename: "{app}\DevMonitor.exe"; Description: "Launch DevMonitor"; Flags: nowait postinstall skipifsilent
+"@
 
           Set-Content `
             -Path $scriptPath `
@@ -269,18 +368,23 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $packageName = "DevMonitor-Windows-$env:BUILD_VERSION.zip"
-          $packagePath = Join-Path $env:GITHUB_WORKSPACE $packageName
+
+          $packagePath = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            $packageName
 
           if (Test-Path $packagePath) {
-            Remove-Item $packagePath -Force
+            Remove-Item `
+              $packagePath `
+              -Force
           }
 
           Compress-Archive `
-            -Path "publish\*" `
+            -Path (Join-Path $env:GITHUB_WORKSPACE "publish\*") `
             -DestinationPath $packagePath `
             -Force
 
-          Write-Host "Package created:"
+          Write-Host "Standalone package created:"
           Write-Host $packagePath
 
           "PACKAGE_PATH=$packagePath" >> $env:GITHUB_ENV
@@ -290,8 +394,12 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
+          $installerDir = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "installer"
+
           $installer = Get-ChildItem `
-            -Path "installer" `
+            -Path $installerDir `
             -Filter "*.exe" `
             -File |
             Select-Object -First 1
@@ -329,11 +437,11 @@ jobs:
           Write-Host "DevMonitor Windows build completed"
           Write-Host "============================================"
           Write-Host "Version: $env:BUILD_VERSION"
-          Write-Host "Source:  $env:SOURCE_ZIP"
+          Write-Host "Source ZIP: $env:SOURCE_ZIP_NAME"
           Write-Host ""
-          Write-Host "The GitHub Actions artifacts contain:"
-          Write-Host "1. Normal Windows installer"
-          Write-Host "2. Standalone application package"
+          Write-Host "Artifacts created:"
+          Write-Host " - Windows Installer"
+          Write-Host " - Standalone Package"
           Write-Host ""
           Write-Host "Previous builds are not overwritten."
           Write-Host "============================================"
